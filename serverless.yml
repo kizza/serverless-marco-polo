@@ -1,0 +1,122 @@
+org: kizza
+app: marco-polo
+service: play
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  localstack:
+    stages:
+      - local
+    host: http://localhost
+    lambda:
+      mountCode: true
+  esbuild:
+    config: "./esbuild.config.js"
+
+provider:
+  name: aws
+  stage: ${opt:stage, "dev"}
+  runtime: nodejs18.x
+  iam:
+    role:
+      statements:
+        # SNS capabilities
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource: !Ref MarcoTopic # nb. Cannot use Fn::GetAtt: [MarcoTopic, Arn] (attribute Arn does not exist for sns topics)
+
+  # Default is {service-stage}
+  stackName: ${self:app}-${self:service}-${self:provider.stage}
+
+  # Enable api-gateway
+  httpApi:
+    name: ${self:app}-${self:service}-api-gateway-${self:provider.stage}
+    cors: true
+
+# Disable default esbuild (in favour of serverless-esbuild plugin)
+build:
+  esbuild: false
+
+functions:
+  greeting:
+    handler: src/index.handler
+    events:
+      - http:
+          method: GET
+          path: /
+
+  # "Marco!?" call, put on queue via sns
+  marco:
+    handler: src/marco.handler
+    environment:
+      TOPIC_ARN: !Ref MarcoTopic # Make topic available in context
+    events:
+      - http:
+          method: GET
+          path: /marco
+
+  # "Polo!!" response, reading from queue
+  polo:
+    handler: src/polo.handler
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - MarcoQueue
+              - Arn
+
+# Declare our additional resources (in Cloud Formation syntax)
+resources:
+  Resources:
+    # The topic used to populate our queue
+    MarcoTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:app}-${self:service}-marco-topic-${self:provider.stage}
+
+    # Our queue (with a dead-letter-queue)
+    MarcoQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:app}-${self:service}-marco-queue-${self:provider.stage}
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [ MarcoDLQQueue, Arn ]
+          maxReceiveCount: 5
+    MarcoDLQQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:app}-${self:service}-marco-queue-dlq-${self:provider.stage}
+
+    # Subscribe our topic to the queue (ensuring a queue policy allowing sns to add messages)
+    MarcoSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn:
+          Ref: MarcoTopic
+        Protocol: sqs
+        Endpoint:
+          Fn::GetAtt:
+            - MarcoQueue
+            - Arn
+    MarcoQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref MarcoQueue
+        PolicyDocument:
+          Id: AllowSnsPublishToQueue
+          Statement:
+            - Effect: Allow
+              Principal:
+                AWS: "*"
+              Action:
+                - sqs:SendMessage
+              Resource:
+                - !GetAtt MarcoQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref MarcoTopic
